@@ -1030,7 +1030,7 @@ components:
           description: 工具 ID（如 bash, edit, read）
         title:
           type: string
-          description: 人类可读的操作描述（如 "Running: npm test"）
+          description: '人类可读的操作描述（如 "Running: npm test"）'
         input:
           type: object
           additionalProperties: true
