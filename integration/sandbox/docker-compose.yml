@@ -1,0 +1,54 @@
+version: "3.9"
+
+# 本地开发用 docker-compose
+# 模拟单用户沙箱环境
+# 使用: docker-compose up -d
+
+services:
+  opencode-sandbox:
+    build:
+      context: ../..
+      dockerfile: integration/sandbox/Dockerfile
+    container_name: opencode-sandbox-dev
+    ports:
+      - "4096:4096"
+    environment:
+      # 沙箱认证密码（生产环境每个沙箱使用唯一随机密码）
+      - OPENCODE_SERVER_PASSWORD=${OPENCODE_SERVER_PASSWORD:-dev-password-change-me}
+      # LLM 提供商 API Key（至少配置一个）
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - GOOGLE_GENERATIVE_AI_API_KEY=${GOOGLE_GENERATIVE_AI_API_KEY:-}
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}
+    volumes:
+      # 用户代码工作目录（持久化）
+      - workspace-data:/workspace
+      # opencode 数据库和配置（持久化会话历史）
+      - opencode-data:/root/.local/share/opencode
+    restart: unless-stopped
+    # 资源限制（生产环境按需调整）
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 4G
+    # 网络隔离（仅允许访问 LLM API）
+    # 生产环境建议配置 iptables 规则限制出站流量
+    networks:
+      - sandbox-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:4096/global/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+volumes:
+  workspace-data:
+    driver: local
+  opencode-data:
+    driver: local
+
+networks:
+  sandbox-net:
+    driver: bridge

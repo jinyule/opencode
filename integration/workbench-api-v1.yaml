@@ -1,0 +1,1471 @@
+openapi: 3.0.3
+
+info:
+  title: Workbench API
+  description: |
+    编程工作台网关 API — Java 后端对前端暴露的接口规范。
+
+    本服务作为 opencode 沙箱集群的代理层，负责：
+    - 用户认证与沙箱路由
+    - opencode REST API 的统一代理与格式转换
+    - 技能（Skill）的 CRUD 管理
+    - 沙箱（Sandbox）生命周期管理
+
+    ## 认证
+    所有接口需在 Header 中携带平台 JWT Token：
+    ```
+    Authorization: Bearer <jwt_token>
+    ```
+
+    ## 实时事件
+    实时事件通过 WebSocket 推送，连接地址：
+    ```
+    ws://{host}/ws/workbench
+    ```
+    WebSocket 消息格式见 `WSEvent` Schema。
+
+    ## 版本说明
+    - v1 Phase 1: sandbox, session (核心), config
+    - v1 Phase 2: file, search, provider
+    - v1 Phase 3: skill
+    - v1 Phase 4: fork, revert, permission (完整版)
+  version: 1.0.0
+  contact:
+    name: Platform Team
+
+servers:
+  - url: https://api.your-platform.com/api/workbench
+    description: 生产环境
+  - url: http://localhost:8080/api/workbench
+    description: 本地开发
+
+tags:
+  - name: sandbox
+    description: 沙箱实例管理（创建/启停/销毁）
+  - name: session
+    description: 对话会话管理（代理 opencode session API）
+  - name: message
+    description: 消息发送与历史查询
+  - name: file
+    description: 文件系统操作（浏览/读取/搜索）
+  - name: skill
+    description: 技能（SKILL.md）CRUD 管理
+  - name: provider
+    description: LLM 提供商与模型列表
+  - name: permission
+    description: Agent 权限请求处理
+  - name: config
+    description: 工作台配置
+
+# ─────────────────────────────────────────────
+# PATHS
+# ─────────────────────────────────────────────
+paths:
+
+  # ── Sandbox ──────────────────────────────────
+
+  /sandbox:
+    post:
+      tags: [sandbox]
+      operationId: sandbox.create
+      summary: 创建沙箱
+      description: |
+        为当前用户创建一个新的 opencode 沙箱实例。
+        - 自动分配 Docker 容器、持久卷、独立密码
+        - 注入 LLM API Key 环境变量
+        - 完成后自动建立 SSE 长连接并初始化权限配置
+        - 容器就绪后通过 WebSocket 推送 `sandbox.ready` 事件
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SandboxCreateRequest'
+      responses:
+        "202":
+          description: 创建请求已接受，异步启动中
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SandboxInstance'
+        "409":
+          description: 该用户已存在活跃沙箱
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /sandbox/{sandboxId}:
+    get:
+      tags: [sandbox]
+      operationId: sandbox.get
+      summary: 获取沙箱状态
+      parameters:
+        - $ref: '#/components/parameters/SandboxId'
+      responses:
+        "200":
+          description: 沙箱实例信息
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SandboxInstance'
+        "404":
+          $ref: '#/components/responses/NotFound'
+
+    delete:
+      tags: [sandbox]
+      operationId: sandbox.destroy
+      summary: 销毁沙箱
+      description: 停止并删除容器及所有持久卷，操作不可逆
+      parameters:
+        - $ref: '#/components/parameters/SandboxId'
+      responses:
+        "204":
+          description: 已接受销毁请求
+
+  /sandbox/{sandboxId}/resume:
+    post:
+      tags: [sandbox]
+      operationId: sandbox.resume
+      summary: 恢复挂起的沙箱
+      description: 从 Suspended 状态恢复，重新启动容器并恢复持久卷
+      parameters:
+        - $ref: '#/components/parameters/SandboxId'
+      responses:
+        "202":
+          description: 恢复请求已接受
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SandboxInstance'
+
+  /sandbox/{sandboxId}/suspend:
+    post:
+      tags: [sandbox]
+      operationId: sandbox.suspend
+      summary: 挂起沙箱
+      description: 保存快照后停止容器，持久卷保留，不再占用计算资源
+      parameters:
+        - $ref: '#/components/parameters/SandboxId'
+      responses:
+        "202":
+          description: 挂起请求已接受
+
+  # ── Session ──────────────────────────────────
+
+  /session:
+    post:
+      tags: [session]
+      operationId: session.create
+      summary: 新建对话会话
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SessionCreateRequest'
+      responses:
+        "200":
+          description: 新创建的会话
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Session'
+
+    get:
+      tags: [session]
+      operationId: session.list
+      summary: 获取会话列表
+      parameters:
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 20
+            maximum: 100
+        - name: before
+          in: query
+          description: 游标分页，上一页最后一个会话的 ID
+          schema:
+            type: string
+      responses:
+        "200":
+          description: 会话列表
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Session'
+                  nextCursor:
+                    type: string
+                    nullable: true
+
+  /session/{sessionId}:
+    get:
+      tags: [session]
+      operationId: session.get
+      summary: 获取会话详情
+      parameters:
+        - $ref: '#/components/parameters/SessionId'
+      responses:
+        "200":
+          description: 会话详情
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Session'
+        "404":
+          $ref: '#/components/responses/NotFound'
+
+    patch:
+      tags: [session]
+      operationId: session.update
+      summary: 更新会话信息
+      parameters:
+        - $ref: '#/components/parameters/SessionId'
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                title:
+                  type: string
+                  description: 会话标题
+      responses:
+        "200":
+          description: 更新后的会话
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Session'
+
+    delete:
+      tags: [session]
+      operationId: session.delete
+      summary: 删除会话
+      parameters:
+        - $ref: '#/components/parameters/SessionId'
+      responses:
+        "204":
+          description: 删除成功
+
+  /session/{sessionId}/abort:
+    post:
+      tags: [session]
+      operationId: session.abort
+      summary: 取消 Agent 执行
+      description: 立即中止当前正在执行的 Agent 循环，会话保持存在
+      parameters:
+        - $ref: '#/components/parameters/SessionId'
+      responses:
+        "204":
+          description: 取消成功
+
+  /session/{sessionId}/fork:
+    post:
+      tags: [session]
+      operationId: session.fork
+      summary: 分支会话
+      description: 在指定消息处创建分支，生成新的独立会话
+      parameters:
+        - $ref: '#/components/parameters/SessionId'
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                messageId:
+                  type: string
+                  description: 从哪条消息开始分支（不填则从最新消息）
+      responses:
+        "200":
+          description: 分支出的新会话
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Session'
+
+  /session/{sessionId}/diff:
+    get:
+      tags: [session]
+      operationId: session.diff
+      summary: 获取文件变更差异
+      parameters:
+        - $ref: '#/components/parameters/SessionId'
+        - name: messageId
+          in: query
+          required: true
+          description: 目标消息 ID
+          schema:
+            type: string
+      responses:
+        "200":
+          description: 文件差异列表
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/FileDiff'
+
+  /session/{sessionId}/revert:
+    post:
+      tags: [session]
+      operationId: session.revert
+      summary: 回滚至指定消息时的状态
+      parameters:
+        - $ref: '#/components/parameters/SessionId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [messageId]
+              properties:
+                messageId:
+                  type: string
+      responses:
+        "200":
+          description: 回滚成功，返回更新后的会话
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Session'
+
+  /session/{sessionId}/unrevert:
+    post:
+      tags: [session]
+      operationId: session.unrevert
+      summary: 恢复回滚（撤销 revert）
+      parameters:
+        - $ref: '#/components/parameters/SessionId'
+      responses:
+        "200":
+          description: 恢复成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Session'
+
+  # ── Message ──────────────────────────────────
+
+  /session/{sessionId}/message:
+    post:
+      tags: [message]
+      operationId: message.send
+      summary: 发送消息（异步）
+      description: |
+        向指定会话发送消息，触发 Agent 循环。
+        - 立即返回 202，不等待 Agent 执行完成
+        - Agent 执行过程通过 WebSocket 事件实时推送
+        - 支持文本、文件（URL 引用）等多种 Part 类型
+      parameters:
+        - $ref: '#/components/parameters/SessionId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MessageSendRequest'
+      responses:
+        "202":
+          description: 消息已接受，Agent 循环已启动
+        "409":
+          description: 该会话正在执行中，请先 abort 或等待完成
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+    get:
+      tags: [message]
+      operationId: message.list
+      summary: 获取消息历史
+      description: 按时间倒序返回，支持游标分页
+      parameters:
+        - $ref: '#/components/parameters/SessionId'
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 50
+            maximum: 200
+        - name: before
+          in: query
+          description: 游标（上一页最后一条消息的 ID）
+          schema:
+            type: string
+      responses:
+        "200":
+          description: 消息列表
+          headers:
+            x-next-cursor:
+              description: 下一页游标（无更多数据时为空）
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Message'
+
+  # ── File ──────────────────────────────────────
+
+  /file/tree:
+    get:
+      tags: [file]
+      operationId: file.tree
+      summary: 浏览文件树
+      parameters:
+        - name: path
+          in: query
+          description: 相对于 /workspace 的路径
+          schema:
+            type: string
+            default: "."
+      responses:
+        "200":
+          description: 文件节点列表
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/FileNode'
+
+  /file/content:
+    get:
+      tags: [file]
+      operationId: file.content
+      summary: 读取文件内容
+      parameters:
+        - name: path
+          in: query
+          required: true
+          description: 文件路径（相对于 /workspace）
+          schema:
+            type: string
+      responses:
+        "200":
+          description: 文件内容
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FileContent'
+        "404":
+          $ref: '#/components/responses/NotFound'
+
+  /file/status:
+    get:
+      tags: [file]
+      operationId: file.status
+      summary: 获取 Git 状态
+      responses:
+        "200":
+          description: Git 文件变更状态
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/FileStatus'
+
+  /search/file:
+    get:
+      tags: [file]
+      operationId: search.file
+      summary: 按文件名搜索
+      parameters:
+        - name: query
+          in: query
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: 匹配的文件路径列表
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: string
+
+  /search/code:
+    get:
+      tags: [file]
+      operationId: search.code
+      summary: 按内容搜索代码
+      description: 使用 ripgrep 搜索文件内容
+      parameters:
+        - name: pattern
+          in: query
+          required: true
+          description: 搜索正则或关键词
+          schema:
+            type: string
+        - name: glob
+          in: query
+          description: 文件过滤 glob 模式（如 *.ts）
+          schema:
+            type: string
+      responses:
+        "200":
+          description: 搜索结果
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/SearchResult'
+
+  # ── Skill ──────────────────────────────────────
+
+  /skill:
+    get:
+      tags: [skill]
+      operationId: skill.list
+      summary: 列出所有技能
+      description: 返回当前沙箱中已发现的全部技能（项目级 + 用户级）
+      responses:
+        "200":
+          description: 技能列表
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Skill'
+
+    post:
+      tags: [skill]
+      operationId: skill.create
+      summary: 创建技能
+      description: |
+        创建一个新的 SKILL.md 技能文件。
+        - 保存到平台 DB（user_skill 表）
+        - 写入沙箱 /workspace/.opencode/skills/{name}/SKILL.md
+        - 调用 GET /skill 确认技能已被 opencode 发现
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SkillCreateRequest'
+      responses:
+        "200":
+          description: 创建成功的技能
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Skill'
+        "409":
+          description: 技能名称已存在
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /skill/{skillName}:
+    get:
+      tags: [skill]
+      operationId: skill.get
+      summary: 获取技能详情
+      parameters:
+        - $ref: '#/components/parameters/SkillName'
+      responses:
+        "200":
+          description: 技能详情
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Skill'
+        "404":
+          $ref: '#/components/responses/NotFound'
+
+    put:
+      tags: [skill]
+      operationId: skill.update
+      summary: 更新技能
+      parameters:
+        - $ref: '#/components/parameters/SkillName'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SkillUpdateRequest'
+      responses:
+        "200":
+          description: 更新后的技能
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Skill'
+
+    delete:
+      tags: [skill]
+      operationId: skill.delete
+      summary: 删除技能
+      parameters:
+        - $ref: '#/components/parameters/SkillName'
+      responses:
+        "204":
+          description: 删除成功
+
+  # ── Provider ──────────────────────────────────
+
+  /provider:
+    get:
+      tags: [provider]
+      operationId: provider.list
+      summary: 列出 LLM 提供商和可用模型
+      responses:
+        "200":
+          description: 提供商和模型列表
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Provider'
+
+  /provider/{providerId}/auth:
+    put:
+      tags: [provider]
+      operationId: provider.setAuth
+      summary: 设置用户自有 API Key（BYOK）
+      description: 用户提供自己的 LLM 提供商 API Key，存储在沙箱中
+      parameters:
+        - name: providerId
+          in: path
+          required: true
+          schema:
+            type: string
+            example: anthropic
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ProviderAuthRequest'
+      responses:
+        "204":
+          description: 设置成功
+
+  # ── Permission ────────────────────────────────
+
+  /permission/{requestId}/reply:
+    post:
+      tags: [permission]
+      operationId: permission.reply
+      summary: 回复 Agent 权限请求
+      description: |
+        当 Agent 需要执行敏感操作时，会通过 WebSocket 推送 `permission.request` 事件。
+        用户批准或拒绝后，前端调用此接口将决定传递给 opencode。
+      parameters:
+        - name: requestId
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [reply]
+              properties:
+                reply:
+                  type: string
+                  enum: [once, always, reject]
+                  description: |
+                    - `once`: 本次批准
+                    - `always`: 始终批准（本会话内）
+                    - `reject`: 拒绝
+      responses:
+        "204":
+          description: 回复已发送
+
+  # ── Config ────────────────────────────────────
+
+  /config:
+    get:
+      tags: [config]
+      operationId: config.get
+      summary: 获取工作台配置
+      responses:
+        "200":
+          description: 当前配置
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WorkbenchConfig'
+
+    patch:
+      tags: [config]
+      operationId: config.update
+      summary: 更新工作台配置
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/WorkbenchConfigPatch'
+      responses:
+        "200":
+          description: 更新后的配置
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WorkbenchConfig'
+
+# ─────────────────────────────────────────────
+# COMPONENTS
+# ─────────────────────────────────────────────
+components:
+
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: 平台 JWT Token
+
+  parameters:
+    SandboxId:
+      name: sandboxId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: int64
+
+    SessionId:
+      name: sessionId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: int64
+
+    SkillName:
+      name: skillName
+      in: path
+      required: true
+      description: 技能名称（kebab-case）
+      schema:
+        type: string
+        pattern: "^[a-z0-9-]+$"
+
+  responses:
+    NotFound:
+      description: 资源不存在
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+
+  schemas:
+
+    # ── Sandbox ────────────────────────────────
+
+    SandboxCreateRequest:
+      type: object
+      properties:
+        projectId:
+          type: integer
+          format: int64
+          description: 关联的平台项目 ID（可选）
+        template:
+          type: string
+          description: 初始化模板（如 node, python, empty）
+          example: empty
+
+    SandboxInstance:
+      type: object
+      properties:
+        id:
+          type: integer
+          format: int64
+        userId:
+          type: integer
+          format: int64
+        projectId:
+          type: integer
+          format: int64
+          nullable: true
+        status:
+          type: string
+          enum: [creating, starting, running, idle, suspending, suspended, destroying]
+        createdAt:
+          type: string
+          format: date-time
+        lastActiveAt:
+          type: string
+          format: date-time
+          nullable: true
+
+    # ── Session ────────────────────────────────
+
+    SessionCreateRequest:
+      type: object
+      properties:
+        title:
+          type: string
+          description: 会话标题（可选，AI 会自动生成）
+
+    Session:
+      type: object
+      properties:
+        id:
+          type: string
+          description: 平台侧会话 ID
+        title:
+          type: string
+          nullable: true
+        summary:
+          $ref: '#/components/schemas/SessionSummary'
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+
+    SessionSummary:
+      type: object
+      nullable: true
+      properties:
+        additions:
+          type: integer
+        deletions:
+          type: integer
+        files:
+          type: integer
+        cost:
+          type: number
+          format: double
+
+    # ── Message ────────────────────────────────
+
+    MessageSendRequest:
+      type: object
+      required: [parts]
+      properties:
+        parts:
+          type: array
+          minItems: 1
+          items:
+            oneOf:
+              - $ref: '#/components/schemas/TextPartInput'
+              - $ref: '#/components/schemas/FilePartInput'
+              - $ref: '#/components/schemas/SubtaskPartInput'
+          description: 消息组成部分，支持文本、文件、子任务
+        model:
+          $ref: '#/components/schemas/ModelRef'
+        agent:
+          type: string
+          enum: [build, plan, explore]
+          default: build
+          description: 使用的 Agent 类型
+      example:
+        parts:
+          - type: text
+            text: "帮我创建一个 React 组件，实现用户登录表单"
+        model:
+          providerID: anthropic
+          modelID: claude-sonnet-4-6
+        agent: build
+
+    TextPartInput:
+      type: object
+      required: [type, text]
+      properties:
+        type:
+          type: string
+          enum: [text]
+        text:
+          type: string
+          minLength: 1
+          maxLength: 100000
+
+    FilePartInput:
+      type: object
+      required: [type, mime, url]
+      properties:
+        type:
+          type: string
+          enum: [file]
+        mime:
+          type: string
+          example: text/plain
+        url:
+          type: string
+          format: uri
+          description: 文件 URL，沙箱内文件使用 file:// scheme
+          example: file:///workspace/src/main.ts
+
+    SubtaskPartInput:
+      type: object
+      required: [type, prompt, description, agent]
+      properties:
+        type:
+          type: string
+          enum: [subtask]
+        prompt:
+          type: string
+          description: 子任务完整提示词
+        description:
+          type: string
+          description: 子任务简短描述（显示在 UI）
+        agent:
+          type: string
+          description: 子任务使用的 Agent
+
+    ModelRef:
+      type: object
+      required: [providerID, modelID]
+      properties:
+        providerID:
+          type: string
+          description: 提供商 ID
+          example: anthropic
+        modelID:
+          type: string
+          description: 模型 ID
+          example: claude-sonnet-4-6
+
+    Message:
+      type: object
+      properties:
+        id:
+          type: string
+        role:
+          type: string
+          enum: [user, assistant]
+        model:
+          type: string
+          nullable: true
+          description: "格式: providerID:modelID"
+        agent:
+          type: string
+          nullable: true
+        parts:
+          type: array
+          items:
+            $ref: '#/components/schemas/Part'
+        createdAt:
+          type: string
+          format: date-time
+
+    Part:
+      type: object
+      required: [id, type]
+      properties:
+        id:
+          type: string
+        type:
+          type: string
+          enum:
+            - text
+            - reasoning
+            - tool
+            - file
+            - step-start
+            - step-finish
+            - snapshot
+            - patch
+            - agent
+            - retry
+            - compaction
+            - subtask
+        state:
+          oneOf:
+            - $ref: '#/components/schemas/TextPartState'
+            - $ref: '#/components/schemas/ReasoningPartState'
+            - $ref: '#/components/schemas/ToolPartState'
+            - $ref: '#/components/schemas/PatchPartState'
+          description: 根据 type 的不同，state 结构不同
+        time:
+          type: object
+          properties:
+            created:
+              type: string
+              format: date-time
+            updated:
+              type: string
+              format: date-time
+
+    TextPartState:
+      type: object
+      properties:
+        text:
+          type: string
+          description: 完整累积文本（流式时逐渐增长）
+
+    ReasoningPartState:
+      type: object
+      properties:
+        text:
+          type: string
+          description: 推理过程文本
+
+    ToolPartState:
+      type: object
+      required: [status, tool]
+      properties:
+        status:
+          type: string
+          enum: [pending, running, completed, error]
+        tool:
+          type: string
+          description: 工具 ID（如 bash, edit, read）
+        title:
+          type: string
+          description: 人类可读的操作描述（如 "Running: npm test"）
+        input:
+          type: object
+          additionalProperties: true
+          description: 工具调用参数
+        output:
+          type: string
+          nullable: true
+          description: 工具执行输出（completed 时有值）
+        error:
+          type: string
+          nullable: true
+          description: 错误信息（error 时有值）
+        time:
+          type: object
+          properties:
+            start:
+              type: string
+              format: date-time
+            end:
+              type: string
+              format: date-time
+              nullable: true
+
+    PatchPartState:
+      type: object
+      properties:
+        files:
+          type: array
+          items:
+            type: object
+            properties:
+              path:
+                type: string
+              additions:
+                type: integer
+              deletions:
+                type: integer
+
+    # ── File ───────────────────────────────────
+
+    FileNode:
+      type: object
+      properties:
+        name:
+          type: string
+        path:
+          type: string
+          description: 相对于 /workspace 的路径
+        type:
+          type: string
+          enum: [file, directory]
+        ignored:
+          type: boolean
+          description: 是否被 .gitignore 忽略
+        children:
+          type: array
+          nullable: true
+          items:
+            $ref: '#/components/schemas/FileNode'
+
+    FileContent:
+      type: object
+      required: [type, path]
+      properties:
+        path:
+          type: string
+        type:
+          type: string
+          enum: [text, binary]
+        content:
+          type: string
+          nullable: true
+          description: 文本内容（type=text 时有值）
+        encoding:
+          type: string
+          nullable: true
+        mimeType:
+          type: string
+          nullable: true
+        diff:
+          type: string
+          nullable: true
+          description: unified diff（文件有未提交改动时有值）
+
+    FileStatus:
+      type: object
+      properties:
+        path:
+          type: string
+        status:
+          type: string
+          enum: [modified, added, deleted, renamed, untracked]
+        staged:
+          type: boolean
+
+    FileDiff:
+      type: object
+      properties:
+        path:
+          type: string
+        additions:
+          type: integer
+        deletions:
+          type: integer
+        diff:
+          type: string
+          description: unified diff 格式
+
+    SearchResult:
+      type: object
+      properties:
+        path:
+          type: string
+        line:
+          type: integer
+        column:
+          type: integer
+        content:
+          type: string
+          description: 匹配行内容
+
+    # ── Skill ──────────────────────────────────
+
+    SkillCreateRequest:
+      type: object
+      required: [name, description, content]
+      properties:
+        name:
+          type: string
+          pattern: "^[a-z0-9-]+$"
+          minLength: 2
+          maxLength: 50
+          description: 技能唯一标识（kebab-case）
+          example: text-statistics
+        description:
+          type: string
+          maxLength: 200
+          description: 技能简短描述
+          example: 分析中文文本的字数、段落数、首句摘要
+        content:
+          type: string
+          description: SKILL.md 的正文内容（Markdown）
+          example: |
+            当用户要求分析文本时，执行以下步骤：
+            1. 统计总字数
+            2. 统计段落数
+            3. 提取首句摘要
+        scope:
+          type: string
+          enum: [project, global]
+          default: project
+          description: 技能作用范围
+
+    SkillUpdateRequest:
+      type: object
+      properties:
+        description:
+          type: string
+          maxLength: 200
+        content:
+          type: string
+
+    Skill:
+      type: object
+      properties:
+        name:
+          type: string
+        description:
+          type: string
+        content:
+          type: string
+        scope:
+          type: string
+          enum: [project, global]
+        location:
+          type: string
+          description: 沙箱内的文件路径
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+
+    # ── Provider ───────────────────────────────
+
+    Provider:
+      type: object
+      properties:
+        id:
+          type: string
+          example: anthropic
+        name:
+          type: string
+          example: Anthropic
+        connected:
+          type: boolean
+          description: 是否已配置 API Key
+        models:
+          type: array
+          items:
+            $ref: '#/components/schemas/Model'
+
+    Model:
+      type: object
+      properties:
+        id:
+          type: string
+          example: claude-sonnet-4-6
+        name:
+          type: string
+          example: Claude Sonnet 4.6
+        contextLength:
+          type: integer
+          example: 200000
+        supportsTools:
+          type: boolean
+        supportsVision:
+          type: boolean
+        inputCostPer1M:
+          type: number
+          format: double
+          description: 每百万 input token 费用（USD）
+        outputCostPer1M:
+          type: number
+          format: double
+          description: 每百万 output token 费用（USD）
+
+    ProviderAuthRequest:
+      type: object
+      required: [type, key]
+      properties:
+        type:
+          type: string
+          enum: [api]
+        key:
+          type: string
+          description: API Key
+          example: sk-ant-xxx
+
+    # ── Config ─────────────────────────────────
+
+    WorkbenchConfig:
+      type: object
+      properties:
+        permission:
+          $ref: '#/components/schemas/PermissionConfig'
+        defaultModel:
+          $ref: '#/components/schemas/ModelRef'
+        agent:
+          type: object
+          additionalProperties:
+            $ref: '#/components/schemas/AgentConfig'
+
+    WorkbenchConfigPatch:
+      type: object
+      properties:
+        permission:
+          $ref: '#/components/schemas/PermissionConfig'
+        defaultModel:
+          $ref: '#/components/schemas/ModelRef'
+
+    PermissionConfig:
+      type: object
+      properties:
+        edit:
+          type: string
+          enum: [allow, ask, deny]
+          default: allow
+        bash:
+          type: string
+          enum: [allow, ask, deny]
+          default: allow
+        webfetch:
+          type: string
+          enum: [allow, ask, deny]
+          default: allow
+        mcp:
+          type: string
+          enum: [allow, ask, deny]
+          default: allow
+        external_directory:
+          type: string
+          enum: [allow, ask, deny]
+          default: deny
+
+    AgentConfig:
+      type: object
+      properties:
+        model:
+          $ref: '#/components/schemas/ModelRef'
+        maxSteps:
+          type: integer
+          description: 最大工具调用步骤数（防止无限循环）
+          default: 100
+
+    # ── WebSocket Events ───────────────────────
+
+    WSEvent:
+      type: object
+      required: [type, properties]
+      description: |
+        通过 WebSocket 推送的实时事件。
+        连接地址: ws://{host}/ws/workbench
+        认证: 连接时携带 ?token=<jwt_token>
+      properties:
+        type:
+          type: string
+          enum:
+            - sandbox.ready
+            - sandbox.status
+            - message.part.updated
+            - message.part.removed
+            - message.updated
+            - session.status
+            - session.error
+            - permission.request
+            - permission.replied
+            - todo.updated
+          description: 事件类型
+        properties:
+          oneOf:
+            - $ref: '#/components/schemas/SandboxReadyEvent'
+            - $ref: '#/components/schemas/SandboxStatusEvent'
+            - $ref: '#/components/schemas/MessagePartUpdatedEvent'
+            - $ref: '#/components/schemas/SessionStatusEvent'
+            - $ref: '#/components/schemas/SessionErrorEvent'
+            - $ref: '#/components/schemas/PermissionRequestEvent'
+
+    SandboxReadyEvent:
+      type: object
+      description: 沙箱就绪事件（sandbox.ready）
+      properties:
+        sandboxId:
+          type: integer
+          format: int64
+
+    SandboxStatusEvent:
+      type: object
+      description: 沙箱状态变更（sandbox.status）
+      properties:
+        sandboxId:
+          type: integer
+          format: int64
+        status:
+          type: string
+          enum: [creating, starting, running, idle, suspending, suspended, destroying]
+
+    MessagePartUpdatedEvent:
+      type: object
+      description: |
+        消息 Part 更新事件（message.part.updated）
+        这是最频繁的事件，用于渲染步骤日志和流式文本。
+      properties:
+        sessionId:
+          type: string
+        messageId:
+          type: string
+        part:
+          $ref: '#/components/schemas/Part'
+        delta:
+          type: string
+          nullable: true
+          description: 文本增量（仅 part.type=text 时存在，用于流式追加渲染）
+
+    SessionStatusEvent:
+      type: object
+      description: 会话状态变更（session.status）
+      properties:
+        sessionId:
+          type: string
+        status:
+          type: object
+          required: [type]
+          properties:
+            type:
+              type: string
+              enum: [busy, idle, retry]
+            attempt:
+              type: integer
+              nullable: true
+              description: 重试次数（retry 时有值）
+            next:
+              type: string
+              format: date-time
+              nullable: true
+              description: 下次重试时间（retry 时有值）
+
+    SessionErrorEvent:
+      type: object
+      description: 会话错误（session.error）
+      properties:
+        sessionId:
+          type: string
+        error:
+          type: object
+          properties:
+            message:
+              type: string
+            code:
+              type: string
+
+    PermissionRequestEvent:
+      type: object
+      description: Agent 权限请求（permission.request）需要用户确认
+      properties:
+        requestId:
+          type: string
+        sessionId:
+          type: string
+        type:
+          type: string
+          description: 权限类型（bash/edit/webfetch/mcp/external_directory）
+        title:
+          type: string
+          description: 人类可读的操作描述
+        metadata:
+          type: object
+          additionalProperties: true
+          description: 操作详情（如具体命令、文件路径）
+
+    # ── Common ─────────────────────────────────
+
+    ErrorResponse:
+      type: object
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          description: 错误码
+          example: SANDBOX_NOT_FOUND
+        message:
+          type: string
+          description: 错误描述
+          example: 指定的沙箱实例不存在
+
+security:
+  - BearerAuth: []
